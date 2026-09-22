@@ -35,8 +35,7 @@
 #define HEARTBEAT_PERIODO_MS 2000  // duracao de um ciclo do pulso (lento)
 #define HEARTBEAT_MAX_PCT    50    // pico da rampa: % do valor de pixel (0..100)
 
-// --- Aquisicao (barra de progresso, lead-on inicial) ------------------------
-#define AQUISICAO_MS         6000 // duracao do periodo de aquisicao
+// --- Aquisicao (barra de progresso durante MEASURING) -----------------------
 #define BARRA_G_INICIAL      60    // verde inicial da barra (laranja); vai a 0 (vermelho)
 
 // --- Beat (scan proporcional ao BPM) ----------------------------------------
@@ -50,6 +49,18 @@
 #define BPM_DELTA_1          5
 #define BPM_DELTA_2          20
 #define TIME_LEAD_OFF_DELTA  10000
+
+// --- Maquina de estados da interacao / protocolo serial ---------------------
+// START_HOLD_MS: contato precisa permanecer valido continuamente por este
+//   tempo antes de confirmar presenca (emite TC1 START).
+// END_HOLD_MS: lead-off precisa permanecer continuo por este tempo antes de
+//   confirmar ausencia (emite TC1 END). Filtra falhas breves de contato.
+#define START_HOLD_MS        1000
+#define END_HOLD_MS          500
+
+// Criterio de "BPM confiavel" (SIMULADO): tempo em MEASURING antes de
+// considerar o BPM confiavel. Substitui o antigo AQUISICAO_MS.
+#define MEASURE_TIME_MS      6000
 
 // ===========================================================================
 
@@ -157,45 +168,17 @@ void stripHeartbeat() {
 }
 
 // ---------------------------------------------------------------------------
-// Maquina de estados visual da fita
-//
-// Guiada pela deteccao de lead (estado ja filtrado pelo debounce):
-//   REPOUSO    -> lead-off: heartbeat vermelho (pulso de repouso).
-//   AQUISICAO  -> lead-on: barra de progresso laranja enchendo por AQUISICAO_MS.
-//   BEAT       -> apos a aquisicao: scan laranja com periodo proporcional ao BPM.
-//
-// Qualquer lead-off retorna ao REPOUSO e zera o relogio da aquisicao.
-// O BPM e SIMULADO por enquanto (BPM_SIMULADO), para avaliar o efeito visual.
-// Parametros no bloco de config no topo do arquivo.
-// ---------------------------------------------------------------------------
-
-// Estados possiveis da fita.
-enum EstadoFita { REPOUSO, AQUISICAO, BEAT };
-
-// Estado atual e instante em que o lead-on comecou (base do relogio da aquisicao).
-EstadoFita estadoFita = REPOUSO;
-uint32_t   leadOnInicioMs = 0;
-
-// ---------------------------------------------------------------------------
 // Simulacao de variacao de BPM (para visualizar mudanca de ritmo sem medir)
 //
-// A cada novo ciclo de medicao (quando a aquisicao termina e o beat comeca),
-// sorteamos um novo BPM a partir do anterior. A amplitude do sorteio depende
-// de quanto tempo ficamos em lead-off desde o ultimo ciclo:
+// A cada nova interacao (novo TC1 START), sorteamos um novo BPM a partir do
+// anterior. A amplitude depende de quanto tempo ficamos em lead-off desde a
+// interacao anterior (medido entre o END anterior e o novo START):
 //   - lead-off curto  (< TIME_LEAD_OFF_DELTA): variacao pequena, +/- BPM_DELTA_1
 //   - lead-off longo  (>= TIME_LEAD_OFF_DELTA): variacao maior, +/- BPM_DELTA_2
 // O resultado e sempre limitado ao intervalo [BPM_MIN_VALID, BPM_MAX_VALID].
+// Se o anterior estava na borda e o lead-off foi longo, sorteia valor livre.
 // ---------------------------------------------------------------------------
-uint16_t bpmAtual = BPM_SIMULADO;   // BPM em uso no beat atual
-
-// Instante em que o lead-off (repouso) comecou. -1 (indefinido) ate o primeiro.
-// Usado para medir a duracao do repouso entre dois ciclos de medicao.
-int32_t leadOffInicioMs = -1;
-
-// Duracao do ultimo lead-off, CONGELADA no instante do lead-on (fim do
-// repouso). Assim a medicao reflete so o tempo realmente solto, sem somar os
-// 10s da barra de aquisicao. -1 = ainda nao houve um repouso medido.
-int32_t ultimaDuracaoLeadOffMs = -1;
+uint16_t bpmAtual = BPM_SIMULADO;   // ultimo BPM sorteado (base da proxima variacao)
 
 // Sorteia e aplica um novo BPM com base na duracao do ultimo lead-off (ms).
 void sortearNovoBpm(uint32_t duracaoLeadOffMs) {
@@ -203,7 +186,12 @@ void sortearNovoBpm(uint32_t duracaoLeadOffMs) {
 
   uint16_t bpmAnterior = bpmAtual;
   bool leadOffLongo = (duracaoLeadOffMs >= TIME_LEAD_OFF_DELTA);
-  bool naBorda = (bpmAnterior == BPM_MIN_VALID) || (bpmAnterior == BPM_MAX_VALID);
+
+  // "Proximo da borda": a menos de BPM_DELTA_2/2 de qualquer extremo. Assim o
+  // sorteio livre dispara nao so no limite exato, mas tambem na zona proxima.
+  int margem = BPM_DELTA_2 / 2;
+  bool naBorda = (bpmAnterior <= BPM_MIN_VALID + margem) ||
+                 (bpmAnterior >= BPM_MAX_VALID - margem);
 
   int novo;
   int variacao;  // apenas para log; nao usado no sorteio livre
@@ -227,21 +215,29 @@ void sortearNovoBpm(uint32_t duracaoLeadOffMs) {
 
   bpmAtual = (uint16_t)novo;
 
-  // Reporta o BPM sorteado na serial (unico print ativo por ciclo).
-  Serial.print("bpm=");
-  Serial.print(bpmAtual);
-  Serial.print(" (anterior=");
-  Serial.print(bpmAnterior);
-  Serial.print(", variacao=");
-  Serial.print(variacao);
-  Serial.print(", lead_off=");
-  Serial.print(duracaoLeadOffMs);
-  Serial.print("ms, delta=+/-");
-  Serial.print(delta);
-  if (naBorda && leadOffLongo) {
-    Serial.print(", sorteio_livre");
-  }
-  Serial.println(")");
+  // Diagnostico do sorteio silenciado nesta etapa: a serial deve conter APENAS
+  // as mensagens do protocolo TC1 (e a resposta a ID?), para o sistema parceiro
+  // validar sem interferencia. Para reativar, descomente o bloco abaixo.
+  // Serial.print("# bpm sorteado=");
+  // Serial.print(bpmAtual);
+  // Serial.print(" anterior=");
+  // Serial.print(bpmAnterior);
+  // Serial.print(" variacao=");
+  // Serial.print(variacao);
+  // Serial.print(" lead_off=");
+  // Serial.print(duracaoLeadOffMs);
+  // Serial.print("ms delta=+/-");
+  // Serial.print(delta);
+  // if (naBorda && leadOffLongo) {
+  //   Serial.print(" sorteio_livre");
+  // }
+  // Serial.println();
+  (void)bpmAnterior;
+  (void)variacao;
+  (void)duracaoLeadOffMs;
+  (void)delta;
+  (void)naBorda;
+  (void)leadOffLongo;
 }
 
 // Barra de progresso: acende os primeiros N LEDs proporcionalmente ao
@@ -314,53 +310,172 @@ void stripBeatScan(uint16_t bpm) {
   strip.show();
 }
 
-// Controlador da fita: decide o estado a partir do lead-off filtrado e desenha
-// o quadro correspondente. Chamado a cada iteracao do loop().
-void updateStrip(int leadOff) {
-  if (leadOff) {
-    // Lead-off detectado: volta ao repouso e zera o relogio da aquisicao.
-    // Marca o inicio do repouso (so na transicao para REPOUSO) para medir sua
-    // duracao no proximo ciclo de medicao.
-    if (estadoFita != REPOUSO) {
-      leadOffInicioMs = (int32_t)millis();
+// ===========================================================================
+// CAMADA 2: MAQUINA DE ESTADOS DA INTERACAO (fonte da verdade do protocolo)
+//
+// Recebe apenas conceitos abstratos:
+//   contactValid -> true se o contato fisico esta valido (baseado no lead-off)
+//   bpmAvailable / bpmValue -> resultado do criterio de "BPM confiavel"
+// Nao conhece ADC, filtros nem detecao de pico. Produz os eventos do protocolo
+// (START / BPM / END) e expoe seu estado para a camada visual reagir.
+//
+// Estados: WAITING, CONTACT_CONFIRMING, MEASURING, MEASURED, LEAVE_CONFIRMING.
+// Nao usa delay(): os holds sao medidos com millis().
+// ===========================================================================
+enum EstadoInteracao {
+  WAITING,
+  CONTACT_CONFIRMING,
+  MEASURING,
+  MEASURED,
+  LEAVE_CONFIRMING
+};
+
+EstadoInteracao estadoInteracao = WAITING;
+
+// Marcas de tempo para os holds (millis).
+uint32_t contactHoldInicioMs = 0;  // inicio do contato continuo (CONTACT_CONFIRMING)
+uint32_t leaveHoldInicioMs   = 0;  // inicio do lead-off continuo (LEAVE_CONFIRMING)
+
+// Rastreamento da interacao atual.
+bool     bpmEmitidoNestaInteracao = false;  // ja mandamos TC1 BPM? (max 1 por interacao)
+uint32_t measuringInicioMs        = 0;      // inicio do estado MEASURING (criterio de BPM)
+
+// Medicao da duracao do lead-off entre interacoes (para a simulacao de BPM).
+int32_t leadOffInicioMs = -1;  // inicio do ultimo lead-off; -1 = indefinido
+
+// Antes de retornar de LEAVE_CONFIRMING, lembramos se o BPM ja fora emitido
+// para saber se voltamos a MEASURED ou MEASURING.
+
+// --- Camada de protocolo serial (emissao de eventos) -----------------------
+void emitStart() { Serial.println("TC1 START"); }
+void emitBpm(uint16_t bpm) {
+  Serial.print("TC1 BPM:");
+  Serial.println(bpm);
+}
+void emitEnd() { Serial.println("TC1 END"); }
+
+// --- Criterio de "BPM confiavel" (encapsulado, SIMULADO) --------------------
+// Retorna true quando julgamos ter um BPM confiavel para a interacao atual, e
+// escreve o valor em *bpm. Simulacao: confiavel apos MEASURE_TIME_MS em
+// MEASURING; o valor e o BPM ja sorteado no START da interacao. O algoritmo
+// real de deteccao entraria aqui, sem que a maquina de estados precise mudar.
+bool bpmConfiavel(uint16_t *bpm) {
+  if ((millis() - measuringInicioMs) >= MEASURE_TIME_MS) {
+    *bpm = bpmAtual;
+    return true;
+  }
+  return false;
+}
+
+// Avanca a maquina de estados da interacao. contactValid = contato fisico ok.
+void updateInteracao(bool contactValid) {
+  switch (estadoInteracao) {
+
+    case WAITING:
+      // Sem interacao. Ao detectar contato, comeca a confirmar presenca.
+      if (contactValid) {
+        estadoInteracao = CONTACT_CONFIRMING;
+        contactHoldInicioMs = millis();
+      } else {
+        // Continua em lead-off: marca o inicio (uma vez) para medir sua duracao.
+        if (leadOffInicioMs < 0) leadOffInicioMs = (int32_t)millis();
+      }
+      break;
+
+    case CONTACT_CONFIRMING:
+      // Contato precisa se manter por START_HOLD_MS continuos.
+      if (!contactValid) {
+        estadoInteracao = WAITING;              // perdeu antes de confirmar
+        leadOffInicioMs = (int32_t)millis();
+      } else if ((millis() - contactHoldInicioMs) >= START_HOLD_MS) {
+        // Presenca confirmada: nova interacao. Sorteia o BPM desta interacao
+        // com base na duracao do lead-off desde a interacao anterior.
+        uint32_t durLeadOff = (leadOffInicioMs < 0)
+                                ? TIME_LEAD_OFF_DELTA  // 1a interacao: trata como longo
+                                : (uint32_t)(millis() - (uint32_t)leadOffInicioMs);
+        sortearNovoBpm(durLeadOff);
+
+        emitStart();
+        bpmEmitidoNestaInteracao = false;       // limpa resultado anterior
+        measuringInicioMs = millis();
+        estadoInteracao = MEASURING;
+      }
+      break;
+
+    case MEASURING: {
+      // Interacao ativa, sem BPM confiavel ainda.
+      if (!contactValid) {
+        estadoInteracao = LEAVE_CONFIRMING;     // pode ser falha breve
+        leaveHoldInicioMs = millis();
+        break;
+      }
+      uint16_t bpm;
+      if (bpmConfiavel(&bpm)) {
+        emitBpm(bpm);                           // uma unica vez por interacao
+        bpmEmitidoNestaInteracao = true;
+        estadoInteracao = MEASURED;
+      }
+      break;
     }
-    estadoFita = REPOUSO;
-    stripHeartbeat();
-    return;
+
+    case MEASURED:
+      // BPM ja enviado. Nao envia outro. Sai so por lead-off.
+      if (!contactValid) {
+        estadoInteracao = LEAVE_CONFIRMING;
+        leaveHoldInicioMs = millis();
+      }
+      break;
+
+    case LEAVE_CONFIRMING:
+      // Evita que falhas breves encerrem a interacao.
+      if (contactValid) {
+        // Contato voltou antes de END_HOLD_MS: retoma sem novo START.
+        estadoInteracao = bpmEmitidoNestaInteracao ? MEASURED : MEASURING;
+      } else if ((millis() - leaveHoldInicioMs) >= END_HOLD_MS) {
+        // Ausencia confirmada: encerra a interacao.
+        emitEnd();
+        leadOffInicioMs = (int32_t)millis();    // comeca a medir o proximo repouso
+        estadoInteracao = WAITING;
+      }
+      break;
   }
+}
 
-  // Lead-on. Se acabamos de entrar em lead-on, marca o inicio da aquisicao e
-  // CONGELA a duracao do lead-off que acabou de terminar (tempo realmente
-  // solto, sem contar a barra de aquisicao que vem a seguir).
-  if (estadoFita == REPOUSO) {
-    estadoFita = AQUISICAO;
-    leadOnInicioMs = millis();
-    ultimaDuracaoLeadOffMs = (leadOffInicioMs < 0)
-                               ? -1  // ainda nao houve repouso medido (1o ciclo)
-                               : (int32_t)(millis() - (uint32_t)leadOffInicioMs);
-  }
+// ===========================================================================
+// CAMADA 3: EFEITO VISUAL DA FITA (reage ao estado da interacao)
+//
+// Mapeia o estado da interacao para uma animacao, sem logica de tempo propria:
+//   WAITING / CONTACT_CONFIRMING              -> heartbeat (repouso)
+//   MEASURING / LEAVE_CONFIRMING(sem BPM)     -> barra de progresso (medindo)
+//   MEASURED / LEAVE_CONFIRMING(com BPM)      -> scan de batimento no BPM
+// ===========================================================================
+void updateStrip() {
+  switch (estadoInteracao) {
+    case WAITING:
+    case CONTACT_CONFIRMING:
+      stripHeartbeat();
+      break;
 
-  uint32_t decorrido = millis() - leadOnInicioMs;
-
-  if (estadoFita == AQUISICAO) {
-    if (decorrido >= AQUISICAO_MS) {
-      // Aquisicao concluida -> novo ciclo de medicao. Sorteia novo BPM com
-      // base na duracao do lead-off congelada no lead-on. No 1o ciclo (sem
-      // repouso medido), trata como longo (delta maior).
-      uint32_t duracaoLeadOff = (ultimaDuracaoLeadOffMs < 0)
-                                  ? TIME_LEAD_OFF_DELTA
-                                  : (uint32_t)ultimaDuracaoLeadOffMs;
-      sortearNovoBpm(duracaoLeadOff);
-      estadoFita = BEAT;
-    } else {
-      float progresso = (float)decorrido / (float)AQUISICAO_MS;
+    case MEASURING: {
+      float progresso = (float)(millis() - measuringInicioMs) / (float)MEASURE_TIME_MS;
       stripBarraProgresso(progresso);
-      return;
+      break;
     }
-  }
 
-  // Estado BEAT: scan proporcional ao BPM atual (simulado).
-  stripBeatScan(bpmAtual);
+    case MEASURED:
+      stripBeatScan(bpmAtual);
+      break;
+
+    case LEAVE_CONFIRMING:
+      // Mantem o efeito coerente com o que estava antes da falha breve.
+      if (bpmEmitidoNestaInteracao) {
+        stripBeatScan(bpmAtual);
+      } else {
+        float progresso = (float)(millis() - measuringInicioMs) / (float)MEASURE_TIME_MS;
+        stripBarraProgresso(progresso);
+      }
+      break;
+  }
 }
 
 // Teste rapido da fita no boot: pisca vermelho, verde, azul em toda a fita
@@ -539,6 +654,41 @@ void updateLeadOffLed(int leadOff) {
   }
 }
 
+// ---------------------------------------------------------------------------
+// Camada de protocolo serial: comandos recebidos do computador.
+//
+// Le linhas terminadas por newline de forma NAO bloqueante e responde. Por
+// enquanto so trata "ID?" -> "ID:TOQUE_CARDIA:1". Responder a ID? nao altera
+// o estado da medicao. A emissao de eventos (START/BPM/END) fica na maquina
+// de interacao; aqui so tratamos comandos de entrada.
+// ---------------------------------------------------------------------------
+String linhaSerial;  // acumula os caracteres da linha em construcao
+
+void processarComando(const String &cmd) {
+  if (cmd == "ID?") {
+    Serial.println("ID:TOQUE_CARDIA:1");
+  }
+  // Outros comandos podem ser adicionados aqui no futuro.
+}
+
+void lerSerial() {
+  while (Serial.available() > 0) {
+    char c = (char)Serial.read();
+    if (c == '\n' || c == '\r') {
+      if (linhaSerial.length() > 0) {
+        linhaSerial.trim();
+        processarComando(linhaSerial);
+        linhaSerial = "";
+      }
+    } else {
+      linhaSerial += c;
+      if (linhaSerial.length() > 32) {  // guarda contra linha absurda
+        linhaSerial = "";
+      }
+    }
+  }
+}
+
 void setup() {
   Serial.begin(115200);
 
@@ -565,10 +715,8 @@ void setup() {
   //   redScanTrail(1500);
   // }
 
-  // Identificacao no boot. A saida CSV por amostra esta desativada por
-  // enquanto; a serial reporta apenas o BPM sorteado a cada ciclo de medicao.
-  Serial.println("Toque Cardia ECG POC");
-  Serial.println("# saida CSV desativada; reportando apenas bpm por ciclo");
+  // Sem mensagem de boot nesta etapa: a serial emite APENAS o protocolo TC1
+  // (e responde a ID?), para validar com o sistema parceiro sem interferencia.
 
   // Semeia o gerador aleatorio com ruido do ADC (pino de ECG flutuante) para
   // que a simulacao de BPM varie entre execucoes, e nao repita a mesma sequencia.
@@ -597,11 +745,19 @@ void loop() {
   // Estado ESTAVEL apos o filtro de debounce (elimina o chaveamento rapido).
   int leadOff = leadOffDebounce(leadOffCru, millis());
 
-  // Indicadores visuais usam o estado estavel:
-  //  - LED onboard: verde=contato ok, vermelho=eletrodo solto.
-  //  - Fita: heartbeat vermelho em lead-off; apagada em contato ok.
+  // Camada 2: alimenta a maquina de interacao com o conceito abstrato de
+  // contato valido (contactValid = nao lead-off). Ela emite START/BPM/END.
+  bool contactValid = (leadOff == 0);
+  updateInteracao(contactValid);
+
+  // Camada de comando serial (nao bloqueante): responde ID?, etc.
+  lerSerial();
+
+  // Indicadores visuais:
+  //  - LED onboard: verde=contato ok, vermelho=eletrodo solto (estado bruto filtrado).
+  //  - Fita: reage ao estado da interacao.
   updateLeadOffLed(leadOff);
-  updateStrip(leadOff);
+  updateStrip();
 
   // Saida CSV por amostra desativada por enquanto (foco na simulacao visual).
   // Mantemos a amostragem/temporizacao rodando; so nao imprimimos as linhas.
